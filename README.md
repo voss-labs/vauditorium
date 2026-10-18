@@ -48,12 +48,13 @@ No Docker or Postgres install needed. The default runs Postgres in-process with
 ```bash
 cp .env.example .env
 npm run db:migrate   # create the tables
-npm run db:seed      # demo events, applications and a suggestion
+npm run db:seed      # demo events, applications with documents, a suggestion
 npm run dev
 ```
 
 Only one process can open the PGlite folder at a time, so stop `npm run dev`
-before running `db:seed` or `db:studio`. To use a Postgres you run yourself, or
+before running `db:seed` or `db:studio`. Uploaded documents are stored in
+`./.uploads` locally and in a private R2 bucket in production. To use a Postgres you run yourself, or
 Neon, change `DATABASE_URL` in `.env` (examples in `.env.example`).
 
 ### Schema changes

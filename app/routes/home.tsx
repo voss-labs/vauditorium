@@ -1,5 +1,6 @@
 import type { Route } from "./+types/home";
 import VAuditorium, { type EventItem } from "../vauditorium/VAuditorium";
+import { listApplications } from "~/.server/db/queries/applications";
 import { listCalendarEvents } from "~/.server/db/queries/events";
 import { EVENT_TYPE_LABELS, addMonths, formatTimeRange, istDate } from "~/lib/events";
 
@@ -10,14 +11,20 @@ export function meta({}: Route.MetaArgs) {
   ];
 }
 
-// How far either side of today the calendar loads. One auditorium holds at most
-// one event a day, so a year each way is a few hundred small rows, and the
-// month view, the past-events archive and outcomes can all read from one list.
+// How far either side of today the calendar loads. One auditorium holds a
+// handful of events a day at most, so a year each way is a few thousand small
+// rows, and the month view, the past-events archive and outcomes can all read
+// from one list.
 const WINDOW_MONTHS = 12;
 
 export async function loader({}: Route.LoaderArgs) {
   const today = istDate();
-  const rows = await listCalendarEvents(addMonths(today, -WINDOW_MONTHS), addMonths(today, WINDOW_MONTHS));
+  // TODO(auth): applications carry contact details. Load them only for a
+  // signed-in applier (their own) or approver (all), never for viewers.
+  const [rows, applications] = await Promise.all([
+    listCalendarEvents(addMonths(today, -WINDOW_MONTHS), addMonths(today, WINDOW_MONTHS)),
+    listApplications(),
+  ]);
 
   const events: EventItem[] = rows.map((e) => ({
     id: e.id,
@@ -26,6 +33,8 @@ export async function loader({}: Route.LoaderArgs) {
     institute: e.institute,
     type: EVENT_TYPE_LABELS[e.type],
     time: formatTimeRange(e.startTime, e.endTime),
+    startTime: e.startTime.slice(0, 5),
+    endTime: e.endTime.slice(0, 5),
     owner: e.organizer,
     attendees: e.expectedAttendees ?? 0,
     status: e.date < today ? "Past event" : "Booked",
@@ -36,9 +45,9 @@ export async function loader({}: Route.LoaderArgs) {
     streamUrl: e.livestreamUrl ?? undefined,
   }));
 
-  return { events };
+  return { events, applications, today };
 }
 
 export default function Home({ loaderData }: Route.ComponentProps) {
-  return <VAuditorium events={loaderData.events} />;
+  return <VAuditorium events={loaderData.events} applications={loaderData.applications} today={loaderData.today} />;
 }

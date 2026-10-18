@@ -1,4 +1,7 @@
 import React, { useMemo, useState } from 'react';
+import { useRevalidator } from 'react-router';
+import { APPLICATION_STATUS_LABELS, OPEN_STATUSES, type ApplicationView, type TrailEntry } from '~/lib/applications';
+import { AUDITORIUM_CLOSES, AUDITORIUM_OPENS, isWithinHours, slotsOverlap } from '~/lib/events';
 import {
   CalendarDays, LayoutDashboard, ClipboardList,
   Lightbulb, Moon, Sun, Menu, X, ChevronLeft, ChevronRight, Plus, Search, Bell,
@@ -19,6 +22,8 @@ export interface EventItem {
   institute: string;
   type: string;
   time: string;
+  startTime?: string;
+  endTime?: string;
   owner: string;
   attendees: number;
   status: string;
@@ -29,29 +34,31 @@ export interface EventItem {
   streamUrl?: string;
 }
 
-interface RequestItem {
-  id: string;
-  title: string;
-  institute: string;
-  date: string;
-  submitted: string;
-  applicant: string;
-  status: string;
-  people: number;
-  docs: string[];
-  purpose: string;
-  equipment: string;
-  contact: string;
-  email: string;
-  notes: string;
-  attendees?: number;
+// Applications come from the server (app/lib/applications.ts).
+type RequestItem = ApplicationView;
+
+/** POST a form to an API route; resolves to its JSON, or throws its error. */
+async function post<T = unknown>(url: string, body: FormData): Promise<T> {
+  const res = await fetch(url, { method: 'POST', body });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data as T;
 }
 
-const initialRequests: RequestItem[] = [
-  { id: 'VA-026', title: 'Inter-college Hackathon', institute: 'VIIE', date: '2026-10-25', submitted: '14 Oct 2026', applicant: 'Innovation Council', status: 'Under review', people: 350, docs: ['Permission letter.pdf','Event proposal.pdf'], purpose: 'A 12-hour collaborative hackathon for student teams across VDT institutes.', equipment: 'Projector, sound system, Wi-Fi access', contact: 'Aarav Mehta', email: 'innovation@viie.edu', notes: 'Please confirm additional power outlets for the team workstations.' },
-  { id: 'VA-027', title: 'Leadership & Motivation Talk', institute: 'VSIT', date: '2026-10-30', submitted: '15 Oct 2026', applicant: 'Student Council', status: 'Documents requested', people: 240, docs: ['Event outline.pdf'], purpose: 'An invited speaker session for students and faculty.', equipment: 'Projector, 3 microphones, livestream', contact: 'Riya Shah', email: 'council@vsit.edu', notes: 'Please attach the signed institute permission letter.' },
-  { id: 'VA-028', title: 'Alumni Networking Evening', institute: 'VIT', date: '2026-11-06', submitted: '16 Oct 2026', applicant: 'Alumni Relations Cell', status: 'Pending review', people: 300, docs: ['Alumni evening brief.pdf','Permission letter.pdf'], purpose: 'A networking evening connecting alumni, current students and faculty.', equipment: 'Stage, microphones, projector', contact: 'Dev Patel', email: 'alumni@vit.edu', notes: '' },
-];
+/** Upload files one per request; returns the names of any that failed, with why. */
+async function uploadAll(applicationId: string, files: File[]): Promise<string[]> {
+  const failed: string[] = [];
+  for (const file of files) {
+    const body = new FormData();
+    body.set('file', file);
+    try { await post(`/api/applications/${applicationId}/documents`, body); }
+    catch (err) { failed.push(err instanceof Error ? err.message : file.name); }
+  }
+  return failed;
+}
+
+const fmtBytes = (n: number) => n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+const fmtWhen = (iso: string) => new Date(iso).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 const fmtDate = (iso: string, opts: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'short', year: 'numeric' }) =>
   new Date(`${iso}T12:00:00`).toLocaleDateString('en-IN', opts);
@@ -141,6 +148,8 @@ interface BookingState {
   title: string;
   institute: string;
   date: string;
+  startTime: string;
+  endTime: string;
   purpose: string;
   equipment: string;
   contact: string;
@@ -150,22 +159,55 @@ interface BookingState {
   stream: boolean;
 }
 
+const EMPTY_BOOKING: BookingState = { title: '', institute: 'VIT', date: '', startTime: '', endTime: '', purpose: '', equipment: '', contact: '', email: '', attendees: '', type: 'Academic', stream: false };
+
+const ACCEPTED_FILES = '.pdf,.doc,.docx,.png,.jpg,.jpeg';
+const MAX_FILE_BYTES = 4 * 1024 * 1024;
+
+/** Why a booking cannot be submitted as it stands, or '' if it can. */
+function slotProblem(b: BookingState, bookedOn: (date: string) => EventItem[]): string {
+  if (!b.date || !b.startTime || !b.endTime) return '';
+  if (!isWithinHours(b.startTime, b.endTime)) return `Choose a time between ${AUDITORIUM_OPENS} and ${AUDITORIUM_CLOSES}, ending after it starts.`;
+  const clash = bookedOn(b.date).find(e => e.startTime && e.endTime && slotsOverlap({ start: b.startTime, end: b.endTime }, { start: e.startTime, end: e.endTime }));
+  return clash ? `Overlaps "${clash.title}" (${clash.time}).` : '';
+}
+
+function FilePicker({ files, setFiles, hint }: { files: File[]; setFiles: (f: File[]) => void; hint?: string }) {
+  const tooBig = files.filter(f => f.size > MAX_FILE_BYTES);
+  return (
+    <>
+      <label className="upload-zone">
+        <input type="file" multiple accept={ACCEPTED_FILES} onChange={e => setFiles(Array.from(e.target.files || []))} />
+        <span className="upload-icon"><Upload size={18} /></span>
+        <strong>{files.length ? `${files.length} file${files.length === 1 ? '' : 's'} selected` : 'Choose files to upload'}</strong>
+        <span>{files.length ? files.map(f => f.name).join(', ') : hint || 'PDF, DOC, DOCX, PNG or JPEG · up to 4 MB per file'}</span>
+        <span className="upload-browse">Browse files</span>
+      </label>
+      {tooBig.length > 0 && <div className="field-help upload-note"><span className="inline-error"><AlertCircle size={13} /> Over 4 MB: {tooBig.map(f => f.name).join(', ')}</span></div>}
+    </>
+  );
+}
+
 function BookingForm({
-  booking, setBooking, onSubmit, onCancel, error, availableDate, compact = false,
+  booking, setBooking, onSubmit, onCancel, error, bookedOn, minDate, busy, compact = false,
 }: {
   booking: BookingState;
   setBooking: React.Dispatch<React.SetStateAction<BookingState>>;
-  onSubmit: (e: React.FormEvent) => void;
+  onSubmit: (e: React.FormEvent, files: File[]) => void;
   onCancel: () => void;
   error: string;
-  availableDate: (date: string) => boolean;
+  bookedOn: (date: string) => EventItem[];
+  minDate: string;
+  busy: boolean;
   compact?: boolean;
 }) {
   const [files, setFiles] = useState<File[]>([]);
   const update = (key: keyof BookingState, value: string | boolean) =>
     setBooking(prev => ({ ...prev, [key]: value }));
+  const booked = booking.date ? bookedOn(booking.date) : [];
+  const problem = slotProblem(booking, bookedOn);
   return (
-    <form className={`booking-form ${compact ? 'booking-form-compact' : ''}`} onSubmit={onSubmit}>
+    <form className={`booking-form ${compact ? 'booking-form-compact' : ''}`} onSubmit={e => onSubmit(e, files)}>
       <div className="form-section-heading">
         <span className="form-step">01</span>
         <div><strong>Event information</strong><p>Tell us what you are planning.</p></div>
@@ -180,17 +222,26 @@ function BookingForm({
           </select>
         </Field>
         <Field label="Event date" required>
-          <input type="date" value={booking.date} min="2026-10-17" onChange={e => update('date', e.target.value)} required />
+          <input type="date" value={booking.date} min={minDate} onChange={e => update('date', e.target.value)} required />
           <span className="field-help">
-            {booking.date && !availableDate(booking.date)
-              ? <span className="inline-error"><AlertCircle size={13} /> This date has a confirmed booking.</span>
-              : 'Choose a date with no confirmed booking.'}
+            {booked.length
+              ? <>Already booked: {booked.map(e => e.time).join(', ')}</>
+              : booking.date ? 'No confirmed bookings on this date yet.' : 'Several events can share a day if their times do not overlap.'}
           </span>
         </Field>
         <Field label="Event type" required>
           <select value={booking.type} onChange={e => update('type', e.target.value)}>
             {['Academic','Talk','Ceremony','Workshop','Competition','Induction','Other'].map(t => <option key={t}>{t}</option>)}
           </select>
+        </Field>
+        <Field label="Start time" required>
+          <input type="time" value={booking.startTime} min={AUDITORIUM_OPENS} max={AUDITORIUM_CLOSES} step={300} onChange={e => update('startTime', e.target.value)} required />
+        </Field>
+        <Field label="End time" required>
+          <input type="time" value={booking.endTime} min={AUDITORIUM_OPENS} max={AUDITORIUM_CLOSES} step={300} onChange={e => update('endTime', e.target.value)} required />
+          <span className="field-help">
+            {problem ? <span className="inline-error"><AlertCircle size={13} /> {problem}</span> : `The auditorium is bookable ${AUDITORIUM_OPENS}–${AUDITORIUM_CLOSES}.`}
+          </span>
         </Field>
         <Field label="Purpose and event description" required>
           <textarea value={booking.purpose} onChange={e => update('purpose', e.target.value)} placeholder="Describe the event, audience and objectives..." rows={3} required maxLength={1200} />
@@ -199,7 +250,7 @@ function BookingForm({
           <input type="number" min="1" max="5000" value={booking.attendees} onChange={e => update('attendees', e.target.value)} placeholder="e.g. 250" />
         </Field>
         <Field label="Equipment &amp; other requirements">
-          <textarea value={booking.equipment} onChange={e => update('equipment', e.target.value)} rows={2} placeholder="Projector, microphones, livestream..." />
+          <textarea value={booking.equipment} onChange={e => update('equipment', e.target.value)} rows={2} placeholder="Projector, microphones, livestream..." maxLength={1000} />
         </Field>
       </div>
       <div className="form-section-heading">
@@ -218,14 +269,7 @@ function BookingForm({
         <span className="form-step">03</span>
         <div><strong>Supporting documents</strong><p>Attach the institute permission letter and event documents.</p></div>
       </div>
-      <label className="upload-zone">
-        <input type="file" multiple accept=".pdf,.doc,.docx,.png,.jpg,.jpeg" onChange={e => setFiles(Array.from(e.target.files || []))} />
-        <span className="upload-icon"><Upload size={18} /></span>
-        <strong>{files.length ? `${files.length} file${files.length === 1 ? '' : 's'} selected` : 'Choose files to upload'}</strong>
-        <span>{files.length ? files.map(f => f.name).join(', ') : 'PDF, DOC, DOCX or images · 10 MB per file (UI preview)'}</span>
-        <span className="upload-browse">Browse files</span>
-      </label>
-      <div className="field-help upload-note"><AlertCircle size={13} /> Files are selected in your browser only. Secure upload will be enabled by the backend.</div>
+      <FilePicker files={files} setFiles={setFiles} />
       <label className="checkbox-field">
         <input type="checkbox" checked={booking.stream} onChange={e => update('stream', e.target.checked)} />
         <span className="fake-checkbox"><Check size={12} /></span>
@@ -233,38 +277,175 @@ function BookingForm({
       </label>
       <div className="approval-info">
         <ShieldCheck size={17} />
-        <p><strong>What happens next?</strong> Your application will be reviewed by a VDT-level approver. They may approve it or request more documents. The date is confirmed only after approval.</p>
+        <p><strong>What happens next?</strong> Your application will be reviewed by a VDT-level approver. They may approve it or request more documents. The slot is confirmed only after approval.</p>
       </div>
       {error && <div className="form-error" role="alert"><AlertCircle size={15} />{error}</div>}
       <div className="form-actions">
-        <button className="btn btn-outline" type="button" onClick={onCancel}>Cancel</button>
-        <button className="btn btn-primary" type="submit"><Send size={15} /> Submit application</button>
+        <button className="btn btn-outline" type="button" onClick={onCancel} disabled={busy}>Cancel</button>
+        <button className="btn btn-primary" type="submit" disabled={busy || !!problem}><Send size={15} /> {busy ? 'Submitting…' : 'Submit application'}</button>
       </div>
     </form>
   );
 }
 
-export default function VAuditorium({ events: initialEvents }: { events: EventItem[] }) {
-  const now = new Date('2026-10-17T12:00:00');
+// Documents an approver commonly asks for, to drop into the request message.
+const COMMON_DOCUMENTS = [
+  'Signed permission letter from the principal / head of institute',
+  'Event proposal with schedule',
+  'Guest speaker details and consent',
+  'Budget or sponsorship letter',
+  'Safety and crowd management plan',
+];
+
+const TRAIL_TITLES: Record<TrailEntry['kind'], string> = {
+  documents_requested: 'Documents requested',
+  status_change: 'Status changed',
+  query: 'Query',
+  comment: 'Reply',
+};
+
+function RequestDetail({ request, role, onClose, onReview, onReply }: {
+  request: RequestItem;
+  role: string;
+  onClose: () => void;
+  onReview: (id: string, intent: 'request_documents' | 'decline' | 'approve', message: string) => Promise<void>;
+  onReply: (id: string, message: string, files: File[]) => Promise<void>;
+}) {
+  const [message, setMessage] = useState('');
+  const [files, setFiles] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const open = OPEN_STATUSES.includes(request.status);
+  const lastRequest = [...request.trail].reverse().find(t => t.kind === 'documents_requested');
+
+  const run = async (fn: () => Promise<void>, after?: () => void) => {
+    setBusy(true); setError('');
+    try { await fn(); setMessage(''); setFiles([]); after?.(); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Something went wrong.'); }
+    finally { setBusy(false); }
+  };
+  const review = (intent: 'request_documents' | 'decline' | 'approve') => {
+    if (intent === 'request_documents' && !message.trim()) { setError('Say which documents the applicant should upload.'); return; }
+    if (intent === 'decline' && !message.trim()) { setError('Give the applicant a reason for declining.'); return; }
+    run(() => onReview(request.id, intent, message.trim()), intent === 'request_documents' ? undefined : onClose);
+  };
+  const addDocument = (doc: string) =>
+    setMessage(m => m.includes(doc) ? m : (m.trim() ? `${m.trim()}\n- ${doc}` : `Please upload:\n- ${doc}`));
+
+  return (
+    <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}>
+      <div className="modal request-modal" role="dialog" aria-modal="true" aria-labelledby="request-detail-title">
+        <div className="modal-header">
+          <div><div className="eyebrow">{role === 'Approver' ? 'APPLICATION REVIEW' : 'MY APPLICATION'} <span className="eyebrow-separator">/</span> {request.ref}</div><h2 id="request-detail-title">{request.title}</h2><p>Submitted {request.submitted} by {request.applicant}</p></div>
+          <button className="icon-btn" aria-label="Close application" onClick={onClose} disabled={busy}><X size={19} /></button>
+        </div>
+        <div className="detail-status-row"><Status>{request.statusLabel}</Status><span className="institute-tag">{request.institute}</span><span className="event-type">{request.type}</span></div>
+        <div className="request-summary">
+          <div><span>Requested slot</span><strong>{fmtDate(request.date)} · {request.time}</strong></div>
+          <div><span>Expected attendees</span><strong>{request.attendees || '—'}</strong></div>
+          <div><span>Contact person</span><strong>{request.contact}</strong><span>{request.email}</span></div>
+        </div>
+        <div className="detail-docs"><strong>Event purpose</strong><p>{request.purpose}</p></div>
+        <div className="detail-docs"><strong>Equipment &amp; requirements</strong><p>{request.equipment || 'No additional requirements listed.'}{request.livestreamRequested ? ' Livestream / recording requested.' : ''}</p></div>
+
+        <div className="documents-block">
+          <div className="documents-heading"><strong>Supporting documents</strong><span>{request.docs.length} file{request.docs.length === 1 ? '' : 's'}</span></div>
+          {request.docs.length ? request.docs.map(doc => (
+            <div className="document-row" key={doc.id}>
+              {doc.contentType.startsWith('image/')
+                ? <a href={doc.url} target="_blank" rel="noopener noreferrer" className="doc-thumb"><img src={doc.url} alt={doc.name} loading="lazy" /></a>
+                : <span className="document-icon"><FileText size={16} /></span>}
+              <span className="doc-name"><span>{doc.name}</span><small>{fmtBytes(doc.sizeBytes)} · uploaded {fmtWhen(doc.uploadedAt)}</small></span>
+              <a className="icon-btn" href={doc.url} target="_blank" rel="noopener noreferrer" aria-label={`Open ${doc.name}`}><Eye size={15} /></a>
+            </div>
+          )) : <div className="no-documents"><AlertCircle size={15} /> No supporting documents attached yet.</div>}
+        </div>
+
+        {request.trail.length > 0 && (
+          <div className="trail">
+            <strong className="trail-heading">Approval trail</strong>
+            {request.trail.map(t => (
+              <div className={`trail-entry trail-${t.authorRole}`} key={t.id}>
+                <div className="trail-meta"><MessageSquareText size={13} /><strong>{t.kind === 'status_change' && t.toStatus ? APPLICATION_STATUS_LABELS[t.toStatus] : TRAIL_TITLES[t.kind]}</strong><span>{t.authorName} · {fmtWhen(t.at)}</span></div>
+                {t.body && <p>{t.body}</p>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {role === 'Approver' && open && (
+          <div className="review-panel">
+            <Field label="Message to the applicant" hint="Required to request documents or decline. Shown on the approval trail.">
+              <textarea value={message} onChange={e => setMessage(e.target.value)} rows={4} maxLength={2000} placeholder="e.g. Please upload the signed permission letter from your principal." disabled={busy} />
+            </Field>
+            <div className="chip-row" aria-label="Request a specific document">
+              <span>Request:</span>
+              {COMMON_DOCUMENTS.map(d => <button type="button" className="chip" key={d} onClick={() => addDocument(d)} disabled={busy}><Plus size={12} />{d}</button>)}
+            </div>
+            {error && <div className="form-error" role="alert"><AlertCircle size={15} />{error}</div>}
+            <div className="modal-actions">
+              <button className="btn btn-outline" onClick={() => review('request_documents')} disabled={busy}><MessageSquareText size={14} /> Request documents</button>
+              <button className="btn btn-danger-outline" onClick={() => review('decline')} disabled={busy}><XCircle size={14} /> Decline</button>
+              <button className="btn btn-primary" onClick={() => review('approve')} disabled={busy}><Check size={15} /> Approve booking</button>
+            </div>
+          </div>
+        )}
+
+        {role === 'Applier' && open && (
+          <div className="review-panel">
+            {request.status === 'changes_requested' && lastRequest && (
+              <div className="query-note">
+                <MessageSquareText size={16} />
+                <div><strong>The approver asked for</strong><p className="pre-line">{lastRequest.body}</p></div>
+              </div>
+            )}
+            <Field label={request.status === 'changes_requested' ? 'Your reply' : 'Message to the approver'}>
+              <textarea value={message} onChange={e => setMessage(e.target.value)} rows={3} maxLength={2000} placeholder="Add a note, or describe the documents you are attaching." disabled={busy} />
+            </Field>
+            <FilePicker files={files} setFiles={setFiles} hint="Attach the requested documents · PDF, DOC, DOCX, PNG or JPEG · up to 4 MB each" />
+            {error && <div className="form-error" role="alert"><AlertCircle size={15} />{error}</div>}
+            <div className="modal-actions">
+              <button className="btn btn-outline" onClick={onClose} disabled={busy}>Close</button>
+              <button className="btn btn-primary" disabled={busy || (!message.trim() && files.length === 0) || files.some(f => f.size > MAX_FILE_BYTES)} onClick={() => run(() => onReply(request.id, message.trim(), files))}><Send size={14} /> {busy ? 'Sending…' : 'Send to approver'}</button>
+            </div>
+          </div>
+        )}
+
+        {!open && (
+          <div className="approval-note"><ShieldCheck size={16} /><p>This application is {request.statusLabel.toLowerCase()}. {request.status === 'approved' ? 'The event is on the shared calendar.' : 'No further changes can be made.'}</p></div>
+        )}
+        {role === 'Viewer' && open && (
+          <div className="approval-note"><ShieldCheck size={16} /><p>Applications are handled by the applier and VDT approvers.</p></div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function VAuditorium({ events, applications: requests, today }: { events: EventItem[]; applications: RequestItem[]; today: string }) {
+  const now = new Date(`${today}T12:00:00`);
+  const revalidator = useRevalidator();
   const [active, setActive] = useState('Calendar');
   const [role, setRole] = useState('Viewer');
   const [theme, setTheme] = useState('light');
   const [mobileNav, setMobileNav] = useState(false);
-  const [month, setMonth] = useState(9);
-  const [year, setYear] = useState(2026);
-  const [events, setEvents] = useState<EventItem[]>(initialEvents);
-  const [requests, setRequests] = useState<RequestItem[]>(initialRequests);
-  const [selectedDate, setSelectedDate] = useState('2026-10-20');
+  const [month, setMonth] = useState(now.getMonth());
+  const [year, setYear] = useState(now.getFullYear());
+  const [selectedDate, setSelectedDate] = useState(today);
   const [selectedEvent, setSelectedEvent] = useState<EventItem | null>(null);
-  const [selectedRequest, setSelectedRequest] = useState<RequestItem | null>(null);
+  // Kept as an id so the open application refreshes when the server data does.
+  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  const selectedRequest = requests.find(r => r.id === selectedRequestId) ?? null;
+  const setSelectedRequest = (r: RequestItem | null) => setSelectedRequestId(r ? r.id : null);
   const [query, setQuery] = useState('');
   const [instituteFilter, setInstituteFilter] = useState('All institutes');
   const [showBooking, setShowBooking] = useState(false);
   const [toast, setToast] = useState('');
   const [suggestions, setSuggestions] = useState([{ id: 1, text: 'Add a dedicated student club showcase day', category: 'Events', date: '12 Oct 2026', status: 'Under consideration' }]);
   const [suggestion, setSuggestion] = useState('');
-  const [booking, setBooking] = useState<BookingState>({ title: '', institute: 'VIT', date: '', purpose: '', equipment: '', contact: '', email: '', attendees: '', type: 'Academic', stream: false });
+  const [booking, setBooking] = useState<BookingState>(EMPTY_BOOKING);
   const [formError, setFormError] = useState('');
+  const [busy, setBusy] = useState(false);
 
   const navItems: { name: string; icon: React.ElementType; group: string }[] =
     role === 'Viewer' ? [
@@ -290,7 +471,8 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
     `${e.title} ${e.institute} ${e.type}`.toLowerCase().includes(query.toLowerCase())
   );
   const selectedEvents = visibleEvents.filter(e => e.date === selectedDate);
-  const pendingCount = requests.filter(r => r.status !== 'Approved' && r.status !== 'Declined').length;
+  const isOpen = (r: RequestItem) => OPEN_STATUSES.includes(r.status);
+  const pendingCount = requests.filter(isOpen).length;
   const monthDays = new Date(year, month + 1, 0).getDate();
   const firstDay = new Date(year, month, 1).getDay();
   const nullPad: (null)[] = Array.from({ length: firstDay }, () => null);
@@ -299,59 +481,79 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
   // eventDates used for calendar markers
   const eventDates = useMemo(() => new Set(allEvents.map(e => e.date)), [events]);
   const changeMonth = (dir: number) => { const d = new Date(year, month + dir, 1); setMonth(d.getMonth()); setYear(d.getFullYear()); };
-  const notify = (msg: string) => { setToast(msg); window.setTimeout(() => setToast(''), 3200); };
+  const notify = (msg: string) => { setToast(msg); window.setTimeout(() => setToast(''), 4200); };
   const go = (name: string) => { setActive(name); setMobileNav(false); setSelectedEvent(null); setSelectedRequest(null); if (name === 'New booking') setShowBooking(true); };
+  const bookedOn = (date: string) => events.filter(e => e.date === date && e.status === 'Booked');
 
-  const submitBooking = (e: React.FormEvent) => {
+  const submitBooking = async (e: React.FormEvent, files: File[]) => {
     e.preventDefault();
-    if (!booking.title.trim() || !booking.date || !booking.purpose.trim() || !booking.contact.trim() || !booking.email.trim()) {
+    if (!booking.title.trim() || !booking.date || !booking.startTime || !booking.endTime || !booking.purpose.trim() || !booking.contact.trim() || !booking.email.trim()) {
       setFormError('Complete all required fields before submitting.'); return;
     }
-    if (events.some(ev => ev.date === booking.date && ev.status === 'Booked')) {
-      setFormError('That date is already booked. Choose another date.'); return;
+    const problem = slotProblem(booking, bookedOn);
+    if (problem) { setFormError(problem); return; }
+    if (files.some(f => f.size > MAX_FILE_BYTES)) { setFormError('Remove files over 4 MB before submitting.'); return; }
+
+    const body = new FormData();
+    body.set('title', booking.title.trim());
+    body.set('institute', booking.institute);
+    body.set('type', booking.type.toLowerCase());
+    body.set('date', booking.date);
+    body.set('startTime', booking.startTime);
+    body.set('endTime', booking.endTime);
+    body.set('purpose', booking.purpose.trim());
+    body.set('equipment', booking.equipment.trim());
+    body.set('attendees', booking.attendees);
+    body.set('livestream', String(booking.stream));
+    body.set('contactName', booking.contact.trim());
+    body.set('contactEmail', booking.email.trim());
+
+    setBusy(true); setFormError('');
+    try {
+      const created = await post<{ id: string; ref: string }>('/api/applications', body);
+      const failed = await uploadAll(created.id, files);
+      revalidator.revalidate();
+      setBooking(EMPTY_BOOKING); setShowBooking(false); setActive('My applications');
+      notify(failed.length
+        ? `${created.ref} submitted, but ${failed.length} file${failed.length === 1 ? '' : 's'} failed: ${failed.join(' ')} Open the application to try again.`
+        : `${created.ref} submitted for review${files.length ? ` with ${files.length} document${files.length === 1 ? '' : 's'}` : ''}.`);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Could not submit the application.');
+    } finally {
+      setBusy(false);
     }
-    const newId = `VA-${String(29 + requests.length).padStart(3, '0')}`;
-    const item: RequestItem = {
-      id: newId, title: booking.title.trim(), institute: booking.institute,
-      date: booking.date, purpose: booking.purpose, equipment: booking.equipment,
-      contact: booking.contact, email: booking.email,
-      attendees: Number(booking.attendees) || 0, people: Number(booking.attendees) || 0,
-      status: 'Pending review', applicant: booking.contact, docs: [], submitted: '17 Oct 2026', notes: '',
-    };
-    setRequests(prev => [item, ...prev]);
-    setBooking({ title: '', institute: 'VIT', date: '', purpose: '', equipment: '', contact: '', email: '', attendees: '', type: 'Academic', stream: false });
-    setFormError(''); setShowBooking(false); setActive('My applications');
-    notify('Booking application submitted for review.');
   };
 
-  const requestAction = (id: string, action: string) => {
-    setRequests(prev => prev.map(r => r.id === id ? { ...r, status: action } : r));
-    if (action === 'Approved') {
-      const req = requests.find(r => r.id === id);
-      if (req && !events.some(e => e.date === req.date && e.status === 'Booked')) {
-        setEvents(prev => [...prev, {
-          id: Date.now(), date: req.date, title: req.title, institute: req.institute,
-          type: 'Academic', status: 'Booked', owner: req.applicant || req.contact || 'Event team',
-          time: 'Time to be confirmed', description: req.purpose || 'Approved auditorium event',
-          attendees: req.people || req.attendees || 0, equipment: req.equipment, stream: false,
-        }]);
-      }
-      notify('Application approved. Calendar updated in this demo.');
-    } else {
-      notify(`Application marked: ${action}.`);
-    }
-    setSelectedRequest(null);
+  // An approver's request, decline or approval, with the message for the trail.
+  const reviewApplication = async (id: string, intent: 'request_documents' | 'decline' | 'approve', message: string) => {
+    const body = new FormData();
+    body.set('intent', intent);
+    body.set('message', message);
+    await post(`/api/applications/${id}/review`, body);
+    revalidator.revalidate();
+    notify(intent === 'approve' ? 'Application approved. The event is now on the calendar.'
+      : intent === 'decline' ? 'Application declined. The applicant can see your reason.'
+      : 'Document request sent to the applicant.');
+  };
+
+  // The applier's answer: a message, plus any documents that were asked for.
+  const replyToApplication = async (id: string, message: string, files: File[]) => {
+    const failed = await uploadAll(id, files);
+    const body = new FormData();
+    body.set('message', message || `Uploaded ${files.length} document${files.length === 1 ? '' : 's'}.`);
+    await post(`/api/applications/${id}/reply`, body);
+    revalidator.revalidate();
+    if (failed.length) throw new Error(`Reply sent, but some files failed: ${failed.join(' ')}`);
+    notify('Reply sent. The application is back with the approver.');
   };
 
   const submitSuggestion = (e: React.FormEvent) => {
     e.preventDefault();
     if (!suggestion.trim()) return;
-    setSuggestions(prev => [{ id: Date.now(), text: suggestion.trim(), category: 'General', date: '17 Oct 2026', status: 'Under consideration' }, ...prev]);
+    setSuggestions(prev => [{ id: Date.now(), text: suggestion.trim(), category: 'General', date: fmtDate(today), status: 'Under consideration' }, ...prev]);
     setSuggestion('');
     notify('Suggestion submitted. Thank you.');
   };
-
-  const availableDate = (date: string) => !events.some(e => e.date === date && e.status === 'Booked');
 
   return (
     <div className={`app theme-${theme}`} data-theme={theme}>
@@ -595,7 +797,7 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
                     <p>Event completed successfully. The archive entry is available for viewers.</p>
                     <span className="result-chip"><CheckCircle2 size={13} /> Published outcome</span>
                   </div>
-                  <button className="btn btn-outline btn-small" onClick={() => { const ev = events.find(e => e.id === 6); if (ev) setSelectedEvent(ev); }}>View event <ArrowUpRight size={14} /></button>
+                  <button className="btn btn-outline btn-small" onClick={() => { const ev = events.find(e => e.result); if (ev) setSelectedEvent(ev); }}>View event <ArrowUpRight size={14} /></button>
                 </div>
                 <div className="empty-inline"><Sparkles size={16} /><span>More results will appear here as organisers publish outcomes.</span></div>
               </div>
@@ -633,7 +835,7 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
           {active === 'New booking' && (
             <>
               <PageTitle eyebrow="BOOKING WORKSPACE" title="New booking request" subtitle="Submit an auditorium booking application for VDT-level approval." />
-              <BookingForm booking={booking} setBooking={setBooking} onSubmit={submitBooking} onCancel={() => setActive('Calendar')} error={formError} availableDate={availableDate} />
+              <BookingForm booking={booking} setBooking={setBooking} onSubmit={submitBooking} onCancel={() => setActive('Calendar')} error={formError} bookedOn={bookedOn} minDate={today} busy={busy} />
             </>
           )}
 
@@ -642,8 +844,8 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
               <PageTitle eyebrow="BOOKING WORKSPACE" title="My applications" subtitle="Track booking requests and respond to requests for more information." actions={<button className="btn btn-primary" onClick={() => setShowBooking(true)}><Plus size={15} /> New application</button>} />
               <div className="metric-grid">
                 <Metric icon={ClipboardList} label="Applications" value={String(requests.length).padStart(2, '0')} note="Submitted in this demo" />
-                <Metric icon={Clock3} label="In review" value={String(requests.filter(r => r.status !== 'Approved' && r.status !== 'Declined').length).padStart(2, '0')} note="Awaiting a decision" />
-                <Metric icon={CheckCircle2} label="Approved" value={String(requests.filter(r => r.status === 'Approved').length).padStart(2, '0')} note="Confirmed bookings" />
+                <Metric icon={Clock3} label="In review" value={String(requests.filter(isOpen).length).padStart(2, '0')} note="Awaiting a decision" />
+                <Metric icon={CheckCircle2} label="Approved" value={String(requests.filter(r => r.status === 'approved').length).padStart(2, '0')} note="Confirmed bookings" />
               </div>
               <div className="panel table-panel">
                 <div className="panel-header"><div><h2>Application history</h2><p>Updates from the VDT approval process</p></div><span className="subtle-count">{requests.length} RECORDS</span></div>
@@ -653,10 +855,10 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
                     <tbody>
                       {requests.map(r => (
                         <tr key={r.id}>
-                          <td><div className="table-title">{r.title}</div><span className="table-sub">{r.id} · {r.institute}</span></td>
+                          <td><div className="table-title">{r.title}</div><span className="table-sub">{r.ref} · {r.institute}</span></td>
                           <td>{fmtDate(r.date)}</td>
-                          <td>{r.submitted || '17 Oct 2026'}</td>
-                          <td><Status>{r.status}</Status></td>
+                          <td>{r.submitted}</td>
+                          <td><Status>{r.statusLabel}</Status></td>
                           <td><button className="icon-btn" aria-label={`View ${r.title}`} onClick={() => setSelectedRequest(r)}><ArrowUpRight size={16} /></button></td>
                         </tr>
                       ))}
@@ -679,11 +881,11 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
               <div className="overview-columns">
                 <div className="panel table-panel">
                   <div className="panel-header"><div><h2>Needs your review</h2><p>Applications awaiting an approval decision</p></div><button className="text-action" onClick={() => setActive('Applications')}>View all <ArrowUpRight size={14} /></button></div>
-                  {requests.filter(r => r.status !== 'Approved' && r.status !== 'Declined').slice(0, 3).map(r => (
+                  {requests.filter(isOpen).slice(0, 3).map(r => (
                     <button className="review-row" key={r.id} onClick={() => setSelectedRequest(r)}>
                       <span className="review-doc-icon"><FileText size={17} /></span>
-                      <span className="review-copy"><strong>{r.title}</strong><span>{r.id} · {r.institute} · {fmtDate(r.date, { day: 'numeric', month: 'short' })}</span></span>
-                      <Status>{r.status}</Status>
+                      <span className="review-copy"><strong>{r.title}</strong><span>{r.ref} · {r.institute} · {fmtDate(r.date, { day: 'numeric', month: 'short' })}</span></span>
+                      <Status>{r.statusLabel}</Status>
                       <ChevronRight size={15} />
                     </button>
                   ))}
@@ -704,26 +906,26 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
               <div className="toolbar applications-toolbar">
                 <div className="search-field"><Search size={16} /><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search applications..." /></div>
                 <div className="filter-field"><Filter size={15} /><select value={instituteFilter} onChange={e => setInstituteFilter(e.target.value)}><option>All institutes</option>{INSTITUTES.map(i => <option key={i}>{i}</option>)}</select></div>
-                <span className="results-count">{requests.filter(r => (instituteFilter === 'All institutes' || r.institute === instituteFilter) && `${r.title} ${r.id} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())).length} applications</span>
+                <span className="results-count">{requests.filter(r => (instituteFilter === 'All institutes' || r.institute === instituteFilter) && `${r.title} ${r.ref} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())).length} applications</span>
               </div>
               <div className="application-list">
-                {requests.filter(r => (instituteFilter === 'All institutes' || r.institute === instituteFilter) && `${r.title} ${r.id} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())).map(r => (
+                {requests.filter(r => (instituteFilter === 'All institutes' || r.institute === instituteFilter) && `${r.title} ${r.ref} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())).map(r => (
                   <button className="panel application-row" key={r.id} onClick={() => setSelectedRequest(r)}>
                     <span className="application-file-icon"><FileText size={20} /></span>
                     <span className="application-row-copy">
-                      <span className="application-id">{r.id} <i /> {r.institute}</span>
+                      <span className="application-id">{r.ref} <i /> {r.institute}</span>
                       <strong>{r.title}</strong>
                       <span className="application-meta">
                         <span><CalendarDays size={13} />{fmtDate(r.date)}</span>
-                        <span><Users size={13} />{r.people || r.attendees || '—'} attendees</span>
+                        <span><Users size={13} />{r.attendees || '—'} attendees</span>
                         <span><Paperclip size={13} />{r.docs?.length || 0} documents</span>
                       </span>
                     </span>
-                    <span className="application-row-end"><Status>{r.status}</Status><ChevronRight size={17} /></span>
+                    <span className="application-row-end"><Status>{r.statusLabel}</Status><ChevronRight size={17} /></span>
                   </button>
                 ))}
               </div>
-              {requests.every(r => (instituteFilter !== 'All institutes' && r.institute !== instituteFilter) || !`${r.title} ${r.id} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())) && <EmptyState icon={ClipboardList} title="No applications found" body="Try a different search or institute filter." />}
+              {requests.every(r => (instituteFilter !== 'All institutes' && r.institute !== instituteFilter) || !`${r.title} ${r.ref} ${r.applicant}`.toLowerCase().includes(query.toLowerCase())) && <EmptyState icon={ClipboardList} title="No applications found" body="Try a different search or institute filter." />}
             </>
           )}
 
@@ -742,7 +944,7 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
               <div><div className="eyebrow">NEW APPLICATION <span className="eyebrow-separator">/</span> PHASE 02</div><h2 id="booking-title">Book V-Auditorium</h2><p>Provide the event details and supporting documents.</p></div>
               <button className="icon-btn" aria-label="Close booking form" onClick={() => { setShowBooking(false); setFormError(''); }}><X size={19} /></button>
             </div>
-            <BookingForm booking={booking} setBooking={setBooking} onSubmit={submitBooking} onCancel={() => { setShowBooking(false); setFormError(''); }} error={formError} availableDate={availableDate} compact />
+            <BookingForm booking={booking} setBooking={setBooking} onSubmit={submitBooking} onCancel={() => { setShowBooking(false); setFormError(''); }} error={formError} bookedOn={bookedOn} minDate={today} busy={busy} compact />
           </div>
         </div>
       )}
@@ -779,44 +981,13 @@ export default function VAuditorium({ events: initialEvents }: { events: EventIt
       )}
 
       {selectedRequest && (
-        <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setSelectedRequest(null); }}>
-          <div className="modal request-modal" role="dialog" aria-modal="true" aria-labelledby="request-detail-title">
-            <div className="modal-header">
-              <div><div className="eyebrow">APPLICATION REVIEW <span className="eyebrow-separator">/</span> {selectedRequest.id}</div><h2 id="request-detail-title">{selectedRequest.title}</h2><p>Submitted {selectedRequest.submitted || '17 Oct 2026'} by {selectedRequest.applicant || selectedRequest.contact || 'Applicant'}</p></div>
-              <button className="icon-btn" aria-label="Close application" onClick={() => setSelectedRequest(null)}><X size={19} /></button>
-            </div>
-            <div className="detail-status-row"><Status>{selectedRequest.status}</Status><span className="institute-tag">{selectedRequest.institute}</span></div>
-            <div className="request-summary">
-              <div><span>Requested date</span><strong>{fmtDate(selectedRequest.date)}</strong></div>
-              <div><span>Expected attendees</span><strong>{selectedRequest.people || selectedRequest.attendees || '—'}</strong></div>
-              <div><span>Contact person</span><strong>{selectedRequest.contact || selectedRequest.applicant || '—'}</strong></div>
-            </div>
-            <div className="detail-docs"><strong>Event purpose</strong><p>{selectedRequest.purpose || 'No purpose provided.'}</p></div>
-            <div className="detail-docs"><strong>Equipment &amp; requirements</strong><p>{selectedRequest.equipment || 'No additional requirements listed.'}</p></div>
-            <div className="documents-block">
-              <div className="documents-heading"><strong>Supporting documents</strong><span>{selectedRequest.docs?.length || 0} files</span></div>
-              {selectedRequest.docs?.length ? selectedRequest.docs.map(doc => (
-                <div className="document-row" key={doc}>
-                  <span className="document-icon"><FileText size={16} /></span>
-                  <span>{doc}</span>
-                  <button className="icon-btn" aria-label={`Preview ${doc}`} onClick={() => notify('Document preview requires backend file storage.')}><Eye size={15} /></button>
-                </div>
-              )) : <div className="no-documents"><AlertCircle size={15} /> No supporting documents attached in this demo.</div>}
-            </div>
-            {selectedRequest.notes && (
-              <div className="query-note">
-                <MessageSquareText size={16} />
-                <div><strong>Applicant note / outstanding query</strong><p>{selectedRequest.notes}</p></div>
-              </div>
-            )}
-            <div className="approval-note"><ShieldCheck size={16} /><p>Approval adds the event to the shared calendar. Requesting documents returns the application to the applicant.</p></div>
-            <div className="modal-actions">
-              <button className="btn btn-outline" onClick={() => requestAction(selectedRequest.id, 'Documents requested')}><MessageSquareText size={14} /> Request documents</button>
-              <button className="btn btn-danger-outline" onClick={() => requestAction(selectedRequest.id, 'Declined')}><XCircle size={14} /> Decline</button>
-              <button className="btn btn-primary" onClick={() => requestAction(selectedRequest.id, 'Approved')}><Check size={15} /> Approve booking</button>
-            </div>
-          </div>
-        </div>
+        <RequestDetail
+          request={selectedRequest}
+          role={role}
+          onClose={() => setSelectedRequest(null)}
+          onReview={reviewApplication}
+          onReply={replyToApplication}
+        />
       )}
 
       {toast && (

@@ -44,3 +44,14 @@ export function getDb(): Promise<Database> {
   });
   return _db;
 }
+
+/**
+ * Close the connection, for scripts. PGlite must be closed cleanly or the next
+ * open runs crash recovery, which skips ahead in every identity sequence.
+ */
+export async function closeDb(): Promise<void> {
+  if (!_db) return;
+  const db = (await _db) as unknown as { $client?: { close?: () => Promise<void>; end?: () => Promise<void> } };
+  _db = null;
+  await (db.$client?.close ?? db.$client?.end)?.call(db.$client);
+}

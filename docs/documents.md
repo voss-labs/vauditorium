@@ -4,50 +4,59 @@ Permission letters and supporting documents carry signatures, letterheads and
 contact details. This is how they are stored, so that only the people with a
 reason to read one can.
 
-Status: design agreed for phase 2. The `application_documents` table exists;
-the upload and download routes do not yet.
-
 ## Where the bytes live
 
 A **private Cloudflare R2 bucket**, the same storage verp's bug-report worker
-uses, so VOSS already runs and pays for it. The bucket has no public access and
-no `r2.dev` URL. Nothing in it is reachable without a signature the app issues.
+uses, so VOSS already runs it. The bucket has no public access and no `r2.dev`
+URL. Nothing in it is reachable without a signature the app issues.
 
 The database holds only the pointer (`application_documents.storage_key`) and
-what the approver needs to see in a list: name, type, size.
+what the approver sees in a list: name, type, size, upload time.
 
-## Upload
+In development, with no `R2_*` variables set, files go to `./.uploads` instead.
+A production build with R2 unset refuses uploads rather than writing to a
+serverless function's throwaway disk.
 
-1. The browser asks the app for an upload slot, naming the file, its type and
-   size. The app checks them before anything is stored:
-   - type is one of PDF, DOC, DOCX, PNG, JPEG;
-   - size is at most 10 MB;
-   - the application is the caller's own and still editable.
-2. The app generates the key itself: `applications/<application id>/<uuid>.<ext>`.
-   The user's file name never becomes part of a path.
-3. The app returns a presigned `PUT` URL, valid for 5 minutes, bound to that
-   key, content type and content length. The bytes go straight from the browser
-   to R2, so large files never pass through a serverless function.
-4. The browser tells the app the upload finished. The app reads the object's
-   first bytes from R2 and checks they match the claimed type (a PDF starts
-   `%PDF`), then writes the `application_documents` row. An upload that is never
-   confirmed has no row and is deleted by a bucket lifecycle rule after a day.
+## Upload: `POST /api/applications/:id/documents`
 
-## Download
+One file per request, through the app (`app/routes/api.applications.$id.documents.ts`):
 
-There are no permanent links. To open a document, the app checks the caller may
-see that application (its applier, or an approver), then returns a presigned
-`GET` URL valid for 5 minutes, with `Content-Disposition: attachment` so the
-file downloads rather than rendering inside the portal's origin.
+1. Bodies over 4 MB are refused from `Content-Length` before being read.
+2. The application must exist, still be open (not approved, declined or
+   withdrawn), and hold fewer than 15 documents.
+3. The type is decided from the file's **first bytes**, never from its name or
+   the browser's `Content-Type`: PDF, PNG, JPEG, DOC, or DOCX. A text file
+   renamed `.png` is refused.
+4. The server generates the key, `applications/<application id>/<uuid>.<ext>`.
+   The uploader's file name is kept only as a display label, stripped of
+   directories and control characters.
+5. Only then is the file stored and its row written.
 
-## Why not the alternatives
+Why through the app rather than presigned uploads straight to R2: the server
+sees every byte before anything is stored, the bucket needs no CORS rule, and
+there are no orphaned objects from uploads nobody confirmed. The cost is the
+4 MB limit per file, set by Vercel's 4.5 MB request body cap, which is plenty
+for letters and photos. If larger files are ever needed, presigned uploads can
+replace step 5 without changing anything else.
 
-- **Public bucket or public blob URLs**: a guessable or leaked link would expose
-  a signed letter forever.
-- **Files in Postgres**: bloats the database and its backups, and every byte
-  passes through a serverless function with tight body-size limits.
-- **Vercel Blob**: works, but adds a second storage vendor where VOSS already
-  runs R2.
+## Download: `GET /documents/:id`
+
+- PDF, PNG and JPEG open in the tab, so an approver can read a letter or see a
+  photo without downloading it. Word files always download.
+- Every response is `X-Content-Type-Options: nosniff` and carries
+  `Content-Security-Policy: default-src 'none'; sandbox`, so a crafted file
+  cannot run script in the portal's origin.
+- `Cache-Control: private, no-store`.
+- With R2, the app answers with a redirect to a presigned URL valid for
+  **5 minutes**. There are no permanent links.
+
+## Before production
+
+Until auth lands (see the `TODO(auth)` markers), anyone who can reach the app
+can call these routes. Auth must add two checks:
+
+- upload and reply: only the application's own applier;
+- download: that applier, or a VDT approver.
 
 ## Configuration
 

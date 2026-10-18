@@ -9,3 +9,6 @@
 
 # Local PGlite database
 /.pglite/
+
+# Local document storage (dev only)
+/.uploads/
